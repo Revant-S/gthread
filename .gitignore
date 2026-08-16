@@ -1,0 +1,35 @@
+# build output
+build/
+*.o
+*.a
+*.d
+core
+core.*
+perf.data
+perf.data.old
+vgcore.*
+
+# local notes and the working brief, not part of the deliverable
+GTHREAD_BUILD_SPEC.md
+notes/
+TODO.local
+*.local
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# assistant tooling: never goes in the history
+.claude/
+.claude*
+claude*
+CLAUDE.md
+AGENTS.md
+.anthropic/
+.aider*
+.cursor/
+.continue/
+.github/copilot*
