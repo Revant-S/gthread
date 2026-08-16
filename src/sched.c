@@ -69,6 +69,115 @@ static struct gth *gth_sched_pick(void)
     return t;
 }
 
+/*
+ * Take a RUNNABLE thread back off the run queue. Only needed when a thread's
+ * priority changes while it is queued (priority inheritance in sync.c), since
+ * the level it is filed under is no longer the level it belongs at.
+ *
+ * The queue is a singly linked FIFO per level, so this is a walk of one
+ * level's list. That is acceptable precisely because it is rare: it happens
+ * on a priority boost, not on a switch. Making it O(1) would mean doubly
+ * linking every thread and paying for the extra pointer update on the hot
+ * path to speed up the cold one.
+ */
+static void gth_rq_remove(struct gth *t)
+{
+    int p = t->prio;
+    struct gth **link = &grt.rq_head[p];
+    struct gth  *prev = NULL;
+
+    while (*link != NULL && *link != t) {
+        prev = *link;
+        link = &(*link)->next;
+    }
+    if (*link == NULL)
+        return; /* not queued */
+
+    *link = t->next;
+    if (grt.rq_tail[p] == t)
+        grt.rq_tail[p] = prev;
+    if (grt.rq_head[p] == NULL) {
+        grt.rq_tail[p] = NULL;
+        grt.ready_bitmap &= ~((uint32_t)1 << p);
+    }
+    t->next = NULL;
+}
+
+/*
+ * Change a thread's effective priority, moving it between run queue levels if
+ * it is currently queued. Everything else - RUNNING, BLOCKED, SLEEPING - just
+ * takes the new value, because those threads are filed by state rather than
+ * by level and will be enqueued at the new priority when they next become
+ * runnable.
+ */
+void gth_set_effective_prio(struct gth *t, int prio)
+{
+    if (t->prio == prio)
+        return;
+    if (t->state == GTH_RUNNABLE) {
+        gth_rq_remove(t);
+        t->prio = prio;
+        gth_rq_push(t);
+    } else {
+        t->prio = prio;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Wait lists                                                         */
+/* ------------------------------------------------------------------ */
+
+void gth_waitq_push(struct gth **head, struct gth *t)
+{
+    t->next = NULL;
+    while (*head != NULL)
+        head = &(*head)->next;
+    *head = t;
+}
+
+/*
+ * Hand the resource to the most urgent waiter, not to the one that has been
+ * waiting longest. Waking FIFO would mean a low priority thread can be
+ * released ahead of a high priority one that is blocked on the same
+ * semaphore, which is a priority inversion introduced by the runtime itself -
+ * the exact thing the mutex in sync.c goes to some trouble to avoid.
+ *
+ * The scan is O(waiters). A per-priority bucket array in every semaphore
+ * would make it O(1), at 32 pointers per semaphore; wait lists in this
+ * runtime are short and semaphores are many, so the scan wins.
+ */
+struct gth *gth_waitq_pop_highest(struct gth **head)
+{
+    struct gth **best = NULL;
+    struct gth **link = head;
+
+    while (*link != NULL) {
+        if (best == NULL || (*link)->prio > (*best)->prio)
+            best = link;
+        link = &(*link)->next;
+    }
+    if (best == NULL)
+        return NULL;
+    {
+        struct gth *t = *best;
+        *best = t->next;
+        t->next = NULL;
+        return t;
+    }
+}
+
+void gth_waitq_remove(struct gth **head, struct gth *t)
+{
+    while (*head != NULL) {
+        if (*head == t) {
+            *head = t->next;
+            t->next = NULL;
+            return;
+        }
+        head = &(*head)->next;
+    }
+}
+
 void gth_wake(struct gth *t)
 {
     if (t->state == GTH_RUNNABLE || t->state == GTH_RUNNING)
@@ -141,6 +250,17 @@ void gth_switch_to_sched(void)
         perror("gthread: swapcontext");
         abort();
     }
+}
+
+/*
+ * Park the caller. The caller must already be on the wait list that will wake
+ * it, and must be holding a critical section, or a wakeup delivered between
+ * joining the list and switching would be lost.
+ */
+void gth_block(void)
+{
+    grt.cur->state = GTH_BLOCKED;
+    gth_switch_to_sched();
 }
 
 /*

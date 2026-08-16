@@ -17,10 +17,11 @@ OBJS     := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 DEPS     := $(OBJS:.o=.d)
 
 TESTS    := $(patsubst test/%.c,$(BUILD)/%,$(wildcard test/*.c))
+DEMOS    := $(patsubst demo/%.c,$(BUILD)/%,$(wildcard demo/*.c))
 
-.PHONY: all clean test
+.PHONY: all clean test demos deadlock
 
-all: $(LIB) $(TESTS)
+all: $(LIB) $(TESTS) $(DEMOS)
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -34,9 +35,22 @@ $(LIB): $(OBJS)
 $(BUILD)/%: test/%.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
+$(BUILD)/%: demo/%.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+
 # Acceptance tests. Each one exits non-zero if the property it checks fails.
 test: $(TESTS)
 	@for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done
+
+demos: $(DEMOS)
+
+# The deliberate deadlock, built with the locks taken in opposite orders.
+# It is supposed to hang: that is the demonstration. Ctrl-C to get out.
+$(BUILD)/deadlock_demo: demo/deadlock.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) -DDEADLOCK_DEMO $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+
+deadlock: $(BUILD)/deadlock_demo
+	$(BUILD)/deadlock_demo
 
 clean:
 	rm -rf $(BUILD)

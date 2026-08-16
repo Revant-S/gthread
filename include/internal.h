@@ -106,6 +106,11 @@ void  gth_exit_critical(void);
 /* sched.c */
 void  gth_rq_push(struct gth *t);
 void  gth_wake(struct gth *t);
+void  gth_set_effective_prio(struct gth *t, int prio);
+void  gth_waitq_push(struct gth **head, struct gth *t);
+struct gth *gth_waitq_pop_highest(struct gth **head);
+void  gth_waitq_remove(struct gth **head, struct gth *t);
+void  gth_block(void);
 void  gth_switch_to_sched(void);
 void  gth_sched_bootstrap(void);
 void  gth_thread_setup_context(struct gth *t);
