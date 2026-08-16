@@ -48,6 +48,14 @@ void gth_yield(void);
 void gth_exit(void *retval);
 int  gth_join(int tid, void **retval);
 
+/*
+ * Sleep for at least ms milliseconds. The resolution is the scheduler tick
+ * (10 ms), and the deadline is rounded up, so gth_sleep(1) parks until the
+ * next tick rather than returning immediately.
+ */
+void     gth_sleep(unsigned ms);
+uint32_t gth_ticks(void);
+
 int  gth_self(void);
 int  gth_getprio(void);
 int  gth_setprio(int prio);

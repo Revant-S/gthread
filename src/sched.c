@@ -12,6 +12,7 @@
  * (mark state, call gth_switch_to_sched) and none of them contains policy.
  */
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -179,6 +180,16 @@ void gth_thread_setup_context(struct gth *t)
     }
     t->ctx.uc_stack.ss_sp   = t->stack;
     t->ctx.uc_stack.ss_size = t->stack_size;
+
+    /*
+     * getcontext() snapshots the caller's signal mask, and the caller is
+     * go_spawn() running inside a critical section with SIGALRM blocked. Left
+     * alone, the new thread would start life with the timer masked and a
+     * critical depth of zero - unpreemptable forever, and a tight loop in it
+     * would hang the process. The mask has to be built to match the state the
+     * thread actually starts in, not the state of whoever created it.
+     */
+    sigdelset(&t->ctx.uc_sigmask, SIGALRM);
     /*
      * uc_link is NULL on purpose. It is the context to resume when the entry
      * function returns, and a thread that reaches the end of gth_trampoline
@@ -196,21 +207,86 @@ void gth_thread_setup_context(struct gth *t)
 /* The scheduler                                                      */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Move every sleeper whose deadline has passed back onto the run queue.
+ *
+ * The comparison is written as a subtraction cast to signed, not as
+ * now >= deadline, because the tick counter wraps. At 100 Hz a uint32_t wraps
+ * after roughly 497 days, which is exactly the kind of thing that is never
+ * tested and eventually happens; after the wrap a plain >= would consider
+ * every future deadline already expired and every sleep would return
+ * immediately. The subtraction is done in unsigned arithmetic, where wrapping
+ * is defined, and the result reinterpreted as signed: it stays correct as
+ * long as no deadline is more than 2^31 ticks away, which is 248 days.
+ *
+ * The walk is O(number of sleepers), so it is deliberately done at most once
+ * per tick rather than once per switch. With 10k sleeping threads that is a
+ * 10k element walk every 10 ms, not on every context switch. A timer wheel or
+ * a heap would make it O(log n), and if the sleeper list ever became the
+ * bottleneck that is the fix; measured against the switch path it is not
+ * close.
+ */
+static void gth_wake_sleepers(void)
+{
+    uint32_t now = (uint32_t)grt.ticks;
+    struct gth **link;
+
+    if (now == grt.last_wake_scan)
+        return;
+    grt.last_wake_scan = now;
+
+    link = &grt.sleepers;
+    while (*link != NULL) {
+        struct gth *t = *link;
+
+        if ((int32_t)(now - t->wake_tick) >= 0) {
+            *link = t->next;
+            t->next = NULL;
+            gth_rq_push(t);
+        } else {
+            link = &t->next;
+        }
+    }
+}
+
 static void gth_sched_loop(void)
 {
     for (;;) {
-        struct gth *t = gth_sched_pick();
+        struct gth *t;
+
+        gth_wake_sleepers();
+        t = gth_sched_pick();
 
         if (t == NULL) {
             /*
-             * Nothing runnable and, at this milestone, nothing that could
-             * ever become runnable: there are no timers and no I/O yet, so
-             * every remaining thread is blocked on something only another
-             * green thread could deliver. That is a deadlock and the honest
-             * thing is to say so and stop, not to spin.
+             * Nothing runnable right now. If someone is sleeping, the next
+             * timer tick will change that, so wait for it - with sigsuspend
+             * rather than a spin, because a spin here would burn a core to
+             * discover the same thing 10 ms later, and would compete with the
+             * thread it is waiting for on a real workload.
+             *
+             * sigsuspend is the right primitive and not just a convenient
+             * one: the scheduler runs with SIGALRM blocked, so testing the
+             * queue and then waiting are two steps that a tick could slip
+             * between. sigsuspend unblocks and waits as one atomic operation,
+             * which closes that window.
              */
-            fputs("gthread: no runnable threads, all remaining threads are "
-                  "blocked (deadlock)\n", stderr);
+            if (grt.sleepers != NULL) {
+                sigset_t idle;
+                sigprocmask(SIG_SETMASK, NULL, &idle);
+                sigdelset(&idle, SIGALRM);
+                sigsuspend(&idle); /* always returns -1/EINTR */
+                continue;
+            }
+            /*
+             * Nothing runnable, nothing sleeping, nothing that could ever
+             * make a thread runnable again. Every remaining thread is waiting
+             * for another green thread that will never run. Say so and stop:
+             * a deadlock that hangs quietly is a bug report nobody can act
+             * on, and a deadlock that spins looks like a performance problem.
+             */
+            fputs("gthread: deadlock - no runnable threads and no timers "
+                  "pending\n", stderr);
             pause();
             continue;
         }
@@ -263,5 +339,21 @@ void gth_sched_bootstrap(void)
     grt.sched_ctx.uc_stack.ss_sp   = gth_stack_slot(&grt.sched_pool, 0);
     grt.sched_ctx.uc_stack.ss_size = grt.sched_pool.usable;
     grt.sched_ctx.uc_link          = NULL;
+
+    /*
+     * The scheduler always runs with SIGALRM blocked, and the mask is set
+     * here, once, because swapcontext restores it on every entry into the
+     * scheduler for free.
+     *
+     * This is not tidiness, it is a correctness requirement. Between
+     * "grt.cur = t" and the swapcontext that actually installs t's registers
+     * there are a few instructions during which grt.cur names a thread that
+     * is not running. A tick delivered in that window would find cur non-NULL
+     * and switch out - saving the scheduler's own registers into t->ctx, on
+     * top of the context it was about to resume. Blocking the timer for the
+     * whole scheduler removes the window instead of trying to make it small.
+     */
+    sigaddset(&grt.sched_ctx.uc_sigmask, SIGALRM);
+
     makecontext(&grt.sched_ctx, gth_sched_entry, 0);
 }

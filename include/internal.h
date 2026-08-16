@@ -46,6 +46,7 @@ struct gth {
     void      *arg;
     int        detached;
     int        started;    /* has the context been entered at least once */
+    int        crit;       /* critical section nesting depth, see preempt.c */
 };
 
 /*
@@ -76,6 +77,16 @@ struct gth_runtime {
     ucontext_t  sched_ctx;    /* the scheduler loop's own context */
     struct gth_stack_pool pool;       /* green thread stacks */
     struct gth_stack_pool sched_pool; /* one slot: the scheduler's own stack */
+
+    /*
+     * Written by the SIGALRM handler, read everywhere. sig_atomic_t is the
+     * only integer type the C standard promises can be accessed atomically
+     * with respect to a signal handler; volatile stops the compiler from
+     * caching it across the loop in gth_sleep().
+     */
+    volatile sig_atomic_t ticks;
+    uint32_t    last_wake_scan; /* tick at which the sleeper list was last walked */
+    struct gth *sleepers;       /* unsorted list of GTH_SLEEPING threads */
 };
 
 extern struct gth_runtime grt;
@@ -84,6 +95,13 @@ extern struct gth_runtime grt;
 int   gth_stack_pool_init(struct gth_stack_pool *p, size_t nslots, size_t usable);
 void  gth_stack_pool_destroy(struct gth_stack_pool *p);
 void *gth_stack_slot(const struct gth_stack_pool *p, size_t i);
+
+/* preempt.c */
+#define GTH_TICK_MS 10
+int   gth_preempt_init(void);
+void  gth_preempt_stop(void);
+void  gth_enter_critical(void);
+void  gth_exit_critical(void);
 
 /* sched.c */
 void  gth_rq_push(struct gth *t);

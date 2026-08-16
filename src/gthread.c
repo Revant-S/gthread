@@ -83,6 +83,17 @@ int gth_init_config(const gth_config_t *cfg)
     grt.cur = main_thread;
 
     gth_sched_bootstrap();
+
+    if (gth_preempt_init() != 0) {
+        int saved = errno;
+        gth_stack_pool_destroy(&grt.pool);
+        gth_stack_pool_destroy(&grt.sched_pool);
+        free(grt.threads);
+        memset(&grt, 0, sizeof(grt));
+        errno = saved;
+        return -1;
+    }
+
     grt.initialised = 1;
     return 0;
 }
@@ -96,6 +107,7 @@ void gth_shutdown(void)
 {
     if (!grt.initialised)
         return;
+    gth_preempt_stop();
     gth_stack_pool_destroy(&grt.pool);
     gth_stack_pool_destroy(&grt.sched_pool);
     free(grt.threads);
@@ -111,9 +123,12 @@ int go_spawn_ex(void *(*fn)(void *), void *arg, int prio, int detached)
         return -1;
     }
 
+    gth_enter_critical();
     t = gth_slot_acquire();
-    if (t == NULL)
+    if (t == NULL) {
+        gth_exit_critical();
         return -1; /* pool exhausted, errno is EAGAIN */
+    }
 
     t->entry     = fn;
     t->arg       = arg;
@@ -124,6 +139,7 @@ int go_spawn_ex(void *(*fn)(void *), void *arg, int prio, int detached)
     t->retval    = NULL;
     gth_thread_setup_context(t);
     gth_rq_push(t);
+    gth_exit_critical();
     return t->id;
 }
 
@@ -142,14 +158,66 @@ void gth_yield(void)
     /*
      * State stays RUNNING: that is the signal to the scheduler that this
      * thread is still runnable and belongs back on the queue.
+     *
+     * No critical section, on purpose. A tick landing between here and the
+     * switch does exactly what the switch was about to do, so the two race
+     * harmlessly and the cost of covering it would be two sigprocmask calls
+     * on the most frequently executed path in the runtime.
      */
     gth_switch_to_sched();
+}
+
+void gth_sleep(unsigned ms)
+{
+    struct gth *self = grt.cur;
+    uint32_t    delay;
+
+    if (ms == 0) {
+        gth_yield();
+        return;
+    }
+
+    /*
+     * Round up. A deadline of now + 0 ticks has already passed by the time
+     * the scheduler looks at it, so gth_sleep(1) with a 10 ms tick would be a
+     * no-op rather than a short sleep, and code that sleeps in a loop would
+     * turn into a spin.
+     */
+    delay = ((uint32_t)ms + GTH_TICK_MS - 1) / GTH_TICK_MS;
+
+    gth_enter_critical();
+    self->wake_tick = (uint32_t)grt.ticks + delay;
+    self->state     = GTH_SLEEPING;
+    self->next      = grt.sleepers;
+    grt.sleepers    = self;
+    /*
+     * The critical section spans the switch. Parking is three steps - record
+     * the deadline, join the sleeper list, stop being runnable - and a tick
+     * observed between any two of them leaves a thread that is on no list at
+     * all, or on the sleeper list while still marked runnable. The mask
+     * travels with the context, so the section is still held when this thread
+     * is resumed, and is released below.
+     */
+    gth_switch_to_sched();
+    gth_exit_critical();
+}
+
+uint32_t gth_ticks(void)
+{
+    return (uint32_t)grt.ticks;
 }
 
 void gth_exit(void *retval)
 {
     struct gth *self = grt.cur;
 
+    /*
+     * Entered and never left. Once state is DONE the scheduler is entitled to
+     * hand this slot to the next go_spawn(), so a tick between that store and
+     * the switch would let another thread start running on the stack this
+     * function is still executing on.
+     */
+    gth_enter_critical();
     self->retval = retval;
     self->state  = GTH_DONE;
     if (self->joiner != NULL) {
@@ -170,11 +238,10 @@ int gth_join(int tid, void **retval)
         return -1;
     }
     t = &grt.threads[tid];
-    if (t->state == GTH_FREE || t == self || t->detached) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (t->joiner != NULL) {
+
+    gth_enter_critical();
+    if (t->state == GTH_FREE || t == self || t->detached || t->joiner != NULL) {
+        gth_exit_critical();
         errno = EINVAL; /* one joiner per thread, like pthreads */
         return -1;
     }
@@ -192,6 +259,7 @@ int gth_join(int tid, void **retval)
     if (retval != NULL)
         *retval = t->retval;
     gth_slot_release(t);
+    gth_exit_critical();
     return 0;
 }
 
