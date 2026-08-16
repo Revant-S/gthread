@@ -114,6 +114,23 @@ void gth_shutdown(void)
     memset(&grt, 0, sizeof(grt));
 }
 
+/*
+ * Spawning is a slot allocation, nothing more. The pool and every stack in it
+ * were reserved by gth_init(), so this does no mmap, no malloc and no
+ * syscall - which is most of the reason a green thread is one to two orders
+ * of magnitude cheaper to create than a pthread, and is what bench/spawn.c
+ * measures.
+ *
+ * The consequence is that the pool has a fixed size and go_spawn() fails with
+ * EAGAIN when it is full. That is a real difference from Go, where the number
+ * of goroutines is bounded only by memory, and it is a deliberate one: an
+ * unbounded spawn API means an unbounded memory footprint controlled by
+ * whatever is feeding the program, which for the echo server in demo/ would
+ * be whoever is connecting to it. Bounding it moves the failure from "the
+ * kernel kills the process at some unpredictable point" to "go_spawn returns
+ * EAGAIN and the caller decides", and the caller is in a much better position
+ * to decide.
+ */
 int go_spawn_ex(void *(*fn)(void *), void *arg, int prio, int detached)
 {
     struct gth *t;

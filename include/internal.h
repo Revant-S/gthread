@@ -47,6 +47,13 @@ struct gth {
     int        detached;
     int        started;    /* has the context been entered at least once */
     int        crit;       /* critical section nesting depth, see preempt.c */
+    /*
+     * Set by whichever channel operation completes this thread's wait, so
+     * that a thread registered on several channels by gth_select() is woken
+     * by exactly one of them. Cleared by the thread just before it blocks.
+     * See chan_claim() in chan.c.
+     */
+    int        claimed;
 };
 
 /*

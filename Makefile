@@ -19,7 +19,7 @@ DEPS     := $(OBJS:.o=.d)
 TESTS    := $(patsubst test/%.c,$(BUILD)/%,$(wildcard test/*.c))
 DEMOS    := $(patsubst demo/%.c,$(BUILD)/%,$(wildcard demo/*.c))
 
-.PHONY: all clean test demos deadlock
+.PHONY: all clean test demos demo deadlock
 
 all: $(LIB) $(TESTS) $(DEMOS)
 
@@ -43,6 +43,11 @@ test: $(TESTS)
 	@for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done
 
 demos: $(DEMOS)
+
+# The CSP pipeline: generator -> filter -> consumer, then a select with a
+# timeout.
+demo: $(BUILD)/pipeline
+	$(BUILD)/pipeline
 
 # The deliberate deadlock, built with the locks taken in opposite orders.
 # It is supposed to hang: that is the demonstration. Ctrl-C to get out.
