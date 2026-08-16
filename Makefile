@@ -10,16 +10,45 @@ CFLAGS   := -std=c11 -D_GNU_SOURCE -Og -g3 -Wall -Wextra -Wpedantic -Iinclude
 LDFLAGS  :=
 LDLIBS   :=
 
+# Benchmarks are built at -O2, and so is the copy of the library they link
+# against. Measuring an -Og library against an -O2 pthread baseline would make
+# the comparison differ in two things at once, which is exactly what section
+# "benchmark integrity" of the brief forbids.
+#
+# -U_FORTIFY_SOURCE because this toolchain turns fortification on by default at
+# -O2, and fortified longjmp aborts on a jump to a frame that is not on the
+# current stack - which is precisely what a user level thread switch is.
+BENCH_CFLAGS := -std=c11 -D_GNU_SOURCE -O2 -U_FORTIFY_SOURCE -g -Wall -Wextra \
+                -Wpedantic -Iinclude -Ibench
+
+# ASan and ucontext do not get on. The sanitizer tracks one stack per thread
+# and a green thread switch moves the stack pointer somewhere it has never
+# heard of, so without being told it reports stack-buffer-overflow on
+# perfectly good frames and misses real ones. sched.c tells it, through
+# __sanitizer_start_switch_fiber/__sanitizer_finish_switch_fiber, which are
+# compiled in only when __SANITIZE_ADDRESS__ is defined. If a future ASan
+# still produces false positives here, that belongs in the README rather than
+# in a quietly deleted target.
+ASAN_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g3 -fsanitize=address,undefined \
+               -fno-omit-frame-pointer -Wall -Wextra -Wpedantic -Iinclude
+
 BUILD    := build
+O2BUILD  := $(BUILD)/o2
+ASANBUILD := $(BUILD)/asan
 LIB      := $(BUILD)/libgthread.a
+LIBO2    := $(O2BUILD)/libgthread.a
 SRCS     := $(wildcard src/*.c)
 OBJS     := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
-DEPS     := $(OBJS:.o=.d)
+O2OBJS   := $(patsubst src/%.c,$(O2BUILD)/%.o,$(SRCS))
+DEPS     := $(OBJS:.o=.d) $(O2OBJS:.o=.d)
+BENCHES  := $(patsubst bench/%.c,$(BUILD)/%,$(wildcard bench/*.c))
 
 TESTS    := $(patsubst test/%.c,$(BUILD)/%,$(wildcard test/*.c))
+ASANTESTS := $(patsubst test/%.c,$(ASANBUILD)/%,$(wildcard test/*.c))
+ASANOBJS := $(patsubst src/%.c,$(ASANBUILD)/%.o,$(SRCS))
 DEMOS    := $(patsubst demo/%.c,$(BUILD)/%,$(wildcard demo/*.c))
 
-.PHONY: all clean test demos demo deadlock
+.PHONY: all clean test demos demo deadlock bench asan
 
 all: $(LIB) $(TESTS) $(DEMOS)
 
@@ -37,6 +66,20 @@ $(BUILD)/%: test/%.c $(LIB) | $(BUILD)
 
 $(BUILD)/%: demo/%.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+
+$(O2BUILD):
+	@mkdir -p $(O2BUILD)
+
+$(O2BUILD)/%.o: src/%.c | $(O2BUILD)
+	$(CC) $(BENCH_CFLAGS) -MMD -MP -c $< -o $@
+
+$(LIBO2): $(O2OBJS)
+	$(AR) rcs $@ $^
+
+# pthreads appear here and nowhere else in the project: in the benchmarks they
+# are the thing being compared against.
+$(BUILD)/%: bench/%.c $(LIBO2) | $(BUILD)
+	$(CC) $(BENCH_CFLAGS) $< $(LIBO2) $(LDFLAGS) -lpthread -o $@
 
 # Acceptance tests. Each one exits non-zero if the property it checks fails.
 test: $(TESTS)
@@ -61,3 +104,32 @@ clean:
 	rm -rf $(BUILD)
 
 -include $(DEPS)
+
+$(ASANBUILD):
+	@mkdir -p $(ASANBUILD)
+
+$(ASANBUILD)/%.o: src/%.c | $(ASANBUILD)
+	$(CC) $(ASAN_CFLAGS) -MMD -MP -c $< -o $@
+
+$(ASANBUILD)/libgthread.a: $(ASANOBJS)
+	$(AR) rcs $@ $^
+
+$(ASANBUILD)/%: test/%.c $(ASANBUILD)/libgthread.a | $(ASANBUILD)
+	$(CC) $(ASAN_CFLAGS) $< $(ASANBUILD)/libgthread.a -o $@
+
+# The whole test suite under AddressSanitizer and UBSan.
+asan: $(ASANTESTS)
+	@for t in $(ASANTESTS); do echo "== $$t"; \
+		ASAN_OPTIONS=detect_stack_use_after_return=0 $$t || exit 1; done
+
+# Every benchmark, into a fresh bench/results.md. Takes a few minutes: each
+# one runs its workload 11 times plus a discarded warmup.
+bench: $(BENCHES)
+	@rm -f bench/results.md
+	@printf '# Benchmark results\n\nProduced by `make bench`. Every number here was measured on the machine described in each section; none are estimates.\n\n' > bench/results.md
+	$(BUILD)/ctxswitch
+	$(BUILD)/spawn
+	$(BUILD)/scale
+	$(BUILD)/echo_bench
+	@echo
+	@echo "results written to bench/results.md"

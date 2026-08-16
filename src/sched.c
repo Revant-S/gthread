@@ -242,6 +242,39 @@ void gth_slot_release(struct gth *t)
  * the mask travel with the thread across a block, instead of leaking into
  * whoever runs next.
  */
+/*
+ * AddressSanitizer keeps a shadow map of what is and is not a valid stack, and
+ * it learns the bounds of "the stack" once, at thread start. A user level
+ * context switch moves the stack pointer to a region it has never been told
+ * about, so from ASan's point of view the runtime spends its life writing to
+ * unpoisoned memory that ought to be someone's redzone: false positives on
+ * good frames, and silence on the real overflows it was built to catch.
+ *
+ * These two hooks are the documented way to tell it. start_switch_fiber says
+ * "I am about to move to this stack", finish_switch_fiber says "I have
+ * arrived". They only exist in an ASan build, hence the guard, and the whole
+ * thing compiles to nothing in a normal one.
+ */
+#ifdef __SANITIZE_ADDRESS__
+void __sanitizer_start_switch_fiber(void **fake, const void *bottom, size_t size);
+void __sanitizer_finish_switch_fiber(void *fake, const void **bottom, size_t *size);
+
+static void *gth_asan_from;
+
+static void gth_asan_enter(const void *stack, size_t size)
+{
+    __sanitizer_start_switch_fiber(&gth_asan_from, stack, size);
+}
+
+static void gth_asan_leave(void)
+{
+    __sanitizer_finish_switch_fiber(gth_asan_from, NULL, NULL);
+}
+#else
+#define gth_asan_enter(stack, size) ((void)0)
+#define gth_asan_leave()            ((void)0)
+#endif
+
 void gth_switch_to_sched(void)
 {
     struct gth *self = grt.cur;
@@ -301,10 +334,12 @@ void gth_switch_to_sched(void)
      */
     grt.prev = self;
 
+    gth_asan_enter(gth_stack_slot(&grt.sched_pool, 0), grt.sched_pool.usable);
     if (swapcontext(&self->ctx, &grt.sched_ctx) != 0) {
         perror("gthread: swapcontext");
         abort();
     }
+    gth_asan_leave();
 
     /* Running again, and this time really on this thread's own stack. */
     grt.switching = 0;
@@ -345,6 +380,7 @@ static void gth_trampoline(int lo, int hi)
                                    (uintptr_t)(uint32_t)lo);
     void *rv;
 
+    gth_asan_leave();  /* arrived on this thread's stack for the first time */
     grt.switching = 0; /* first entry into this thread, see gth_sched_loop() */
     rv = t->entry(t->arg);
 
@@ -578,10 +614,12 @@ static void gth_sched_loop(void)
         grt.switching = 1;
         grt.cur  = t;
         t->state = GTH_RUNNING;
+        gth_asan_enter(t->stack, t->stack_size);
         if (swapcontext(&grt.sched_ctx, &t->ctx) != 0) {
             perror("gthread: swapcontext");
             abort();
         }
+        gth_asan_leave();
         grt.cur = NULL;
         /* The thread that just left is in grt.prev; the top of the loop has
          * it. Nothing is done with t here, because control does not
@@ -592,6 +630,9 @@ static void gth_sched_loop(void)
 
 static void gth_sched_entry(void)
 {
+    /* First entry into the scheduler's own stack, the far half of the switch
+     * that got us here. Same reason as the call in gth_trampoline(). */
+    gth_asan_leave();
     gth_sched_loop();
     abort(); /* the scheduler loop never returns */
 }
