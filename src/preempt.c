@@ -113,12 +113,18 @@ static void gth_tick_handler(int sig)
     grt.ticks = (sig_atomic_t)((uint32_t)grt.ticks + 1u);
 
     /*
-     * cur is NULL exactly while the scheduler itself is on the CPU. The
-     * scheduler runs with SIGALRM blocked, so the only way to get here in
-     * that state is the deliberate unblock inside sigsuspend() on the idle
-     * path - where the wakeup is the point and there is nothing to preempt.
+     * Two ways there is nothing to preempt. cur is NULL exactly while the
+     * scheduler itself is on the CPU - the scheduler runs with SIGALRM
+     * blocked, so the only way to arrive here in that state is the deliberate
+     * unblock inside sigsuspend() or epoll_pwait() on the idle path, where
+     * the wakeup is the point. And switching is set while the scheduler is
+     * partway through handing control to a thread: grt.cur already names that
+     * thread, but the CPU is still on the scheduler's stack with the thread's
+     * signal mask installed. Preempting there corrupts the context being
+     * resumed; the long comment in gth_sched_loop() has the details. Either
+     * way the tick is dropped, which costs at most one 10 ms slice.
      */
-    if (grt.cur == NULL)
+    if (grt.cur == NULL || grt.switching)
         return;
 
     gth_switch_to_sched();

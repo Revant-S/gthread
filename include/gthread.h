@@ -60,4 +60,29 @@ int  gth_self(void);
 int  gth_getprio(void);
 int  gth_setprio(int prio);
 
+/* ------------------------------------------------------------------ */
+/* Netpoller: blocking-looking I/O that does not block the process     */
+/* ------------------------------------------------------------------ */
+
+#include <sys/socket.h>
+#include <sys/types.h>
+
+/*
+ * These look like read(2), write(2), accept(2) and connect(2) and behave like
+ * them, except that when the fd is not ready they park the calling green
+ * thread and let the rest of the runtime carry on. The fd must be
+ * O_NONBLOCK - gth_socket() and gth_accept() take care of that, or call
+ * gth_set_nonblocking() on an fd from elsewhere.
+ */
+int     gth_set_nonblocking(int fd);
+int     gth_socket(int domain, int type, int protocol);
+ssize_t gth_read(int fd, void *buf, size_t count);
+ssize_t gth_write(int fd, const void *buf, size_t count);
+int     gth_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+int     gth_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+int     gth_close(int fd);
+
+/* Write all of it, or fail. Short writes on a socket are the normal case. */
+ssize_t gth_write_all(int fd, const void *buf, size_t count);
+
 #endif /* GTHREAD_H */

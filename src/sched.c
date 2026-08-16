@@ -246,10 +246,69 @@ void gth_switch_to_sched(void)
 {
     struct gth *self = grt.cur;
 
+    /*
+     * errno has to be saved with the thread, and it is easy to miss.
+     *
+     * In glibc errno is thread local - one copy per OS thread - and this
+     * runtime has exactly one OS thread, so all the green threads share it.
+     * A thread that calls read(), gets -1, and is preempted before it looks
+     * at errno will read whatever errno the threads that ran in between left
+     * behind. That is a bug that shows up as a socket error with an
+     * impossible cause, once every few hours, under load.
+     *
+     * Every switch in the runtime funnels through this function, including
+     * the involuntary one from the timer handler, so saving it here covers
+     * every path. It is the same argument as the one for saving registers:
+     * errno is part of the thread's state, it just happens to live in a
+     * global instead of a register.
+     */
+    self->saved_errno = errno;
+
+    /*
+     * Announce that a switch is in flight before touching swapcontext, and
+     * not after. swapcontext saves this thread's registers into self->ctx and
+     * only then installs the scheduler's signal mask - the two are separate
+     * steps and the timer is still live between them. A tick landing there
+     * would find a perfectly ordinary running thread, call this same function
+     * from the handler, and overwrite the context that was already saved a
+     * few instructions ago. The thread would then have two saved contexts
+     * describing two different points in its own switch, and whichever one
+     * ran second would corrupt the other.
+     *
+     * The flag is cleared on the far side, when this thread has really been
+     * resumed. Between the two the handler declines to preempt, which costs
+     * at most one 10 ms slice and is the only thing that makes a context
+     * switch atomic with respect to the timer.
+     */
+    grt.switching = 1;
+
+    /*
+     * Hand the scheduler the outgoing thread explicitly rather than letting
+     * it work out for itself who just left.
+     *
+     * The obvious implementation is for the scheduler to keep the thread it
+     * resumed in a local variable and deal with it on the far side of its own
+     * swapcontext. That works for every switch except the first one: the
+     * first entry into the scheduler does not return from a swapcontext at
+     * all, it starts gth_sched_loop() from the top, so there is no local
+     * variable and no far side. The thread that made that first switch is
+     * simply forgotten, and if it happened to be still runnable - preempted
+     * rather than blocked - it is never queued again and never runs again.
+     *
+     * It took a while to see because it needs a thread to survive a full
+     * 10 ms tick before its first blocking call. main() spawning five
+     * thousand threads does exactly that; main() spawning three does not.
+     */
+    grt.prev = self;
+
     if (swapcontext(&self->ctx, &grt.sched_ctx) != 0) {
         perror("gthread: swapcontext");
         abort();
     }
+
+    /* Running again, and this time really on this thread's own stack. */
+    grt.switching = 0;
+    errno = self->saved_errno;
 }
 
 /*
@@ -284,7 +343,10 @@ static void gth_trampoline(int lo, int hi)
 {
     struct gth *t = (struct gth *)(((uintptr_t)(uint32_t)hi << 32) |
                                    (uintptr_t)(uint32_t)lo);
-    void *rv = t->entry(t->arg);
+    void *rv;
+
+    grt.switching = 0; /* first entry into this thread, see gth_sched_loop() */
+    rv = t->entry(t->arg);
 
     gth_exit(rv);
     abort(); /* gth_exit does not return */
@@ -369,21 +431,86 @@ static void gth_wake_sleepers(void)
     }
 }
 
+/*
+ * How long the runtime may wait before it has to look at the clock again:
+ * until the earliest sleep deadline, or forever if nobody is sleeping.
+ */
+static int gth_idle_timeout_ms(void)
+{
+    uint32_t now = (uint32_t)grt.ticks;
+    const struct gth *t;
+    int32_t soonest = 0;
+    int have = 0;
+
+    for (t = grt.sleepers; t != NULL; t = t->next) {
+        int32_t delta = (int32_t)(t->wake_tick - now);
+
+        if (delta < 0)
+            delta = 0;
+        if (!have || delta < soonest) {
+            soonest = delta;
+            have    = 1;
+        }
+    }
+    if (!have)
+        return -1;
+    return (int)soonest * GTH_TICK_MS;
+}
+
 static void gth_sched_loop(void)
 {
     for (;;) {
         struct gth *t;
 
+        /*
+         * Deal with whoever just gave up the CPU. What happens to it is
+         * entirely a function of the state it set before switching, which is
+         * why no blocking primitive has to touch the run queue on its way
+         * out: it marks itself and leaves.
+         */
+        if (grt.prev != NULL) {
+            struct gth *prev = grt.prev;
+
+            grt.prev = NULL;
+            switch (prev->state) {
+            case GTH_RUNNING:
+                gth_rq_push(prev); /* yielded or was preempted, still runnable */
+                break;
+            case GTH_DONE:
+                if (prev->detached)
+                    gth_slot_release(prev);
+                break;
+            default:
+                break; /* BLOCKED or SLEEPING: parked on someone else's list */
+            }
+        }
+
         gth_wake_sleepers();
+
+        /*
+         * Poll the netpoller before picking. With runnable threads the wait
+         * is zero - I/O readiness is checked, nobody is kept waiting for it.
+         * With nothing runnable, this call is where the process actually
+         * sleeps, bounded by the next timer deadline so a sleeping thread is
+         * not held up by a quiet socket.
+         *
+         * The guard matters: a program that never touches an fd must not pay
+         * a syscall per scheduling pass for a poller it is not using, and the
+         * context switch benchmark is exactly such a program.
+         */
+        if (grt.netpoll_parked > 0)
+            gth_netpoll(grt.ready_bitmap != 0 ? 0 : gth_idle_timeout_ms());
+
         t = gth_sched_pick();
 
         if (t == NULL) {
             /*
-             * Nothing runnable right now. If someone is sleeping, the next
-             * timer tick will change that, so wait for it - with sigsuspend
-             * rather than a spin, because a spin here would burn a core to
-             * discover the same thing 10 ms later, and would compete with the
-             * thread it is waiting for on a real workload.
+             * Nothing runnable right now. If threads are parked on I/O, the
+             * epoll_pwait above has already done the waiting, so go round
+             * again. Otherwise, if someone is sleeping, wait for the tick -
+             * with sigsuspend rather than a spin, because a spin here would
+             * burn a core to discover the same thing 10 ms later, and would
+             * compete with the thread it is waiting for on a real workload.
              *
              * sigsuspend is the right primitive and not just a convenient
              * one: the scheduler runs with SIGALRM blocked, so testing the
@@ -391,6 +518,8 @@ static void gth_sched_loop(void)
              * between. sigsuspend unblocks and waits as one atomic operation,
              * which closes that window.
              */
+            if (grt.netpoll_parked > 0)
+                continue;
             if (grt.sleepers != NULL) {
                 sigset_t idle;
                 sigprocmask(SIG_SETMASK, NULL, &idle);
@@ -405,12 +534,48 @@ static void gth_sched_loop(void)
              * a deadlock that hangs quietly is a bug report nobody can act
              * on, and a deadlock that spins looks like a performance problem.
              */
-            fputs("gthread: deadlock - no runnable threads and no timers "
-                  "pending\n", stderr);
+            fputs("gthread: deadlock - no runnable threads, no timers "
+                  "pending and no I/O outstanding\n", stderr);
             pause();
             continue;
         }
 
+        /*
+         * The scheduler runs with SIGALRM blocked, which is supposed to make
+         * this whole loop safe from the timer. It is not quite enough, and
+         * the gap is worth understanding because it took a 5,000 connection
+         * test to find it.
+         *
+         * swapcontext() does not install the target's registers and the
+         * target's signal mask at the same instant. glibc sets the mask first
+         * - one rt_sigprocmask carrying the incoming context's uc_sigmask -
+         * and only then loads the registers and jumps. For a handful of
+         * instructions the CPU is therefore still running the scheduler, on
+         * the scheduler's stack, but with the *incoming thread's* mask, in
+         * which SIGALRM is unblocked. grt.cur already names the incoming
+         * thread, because that store has to happen before the switch.
+         *
+         * A tick delivered in that window lands on the scheduler's stack, and
+         * the handler, seeing a non-NULL grt.cur, switches out: it writes the
+         * scheduler's own registers into t->ctx, on top of the context it was
+         * halfway through resuming, and jumps into a scheduler context that is
+         * being overwritten. What comes out the far side is a thread whose
+         * saved context is a partly written signal frame, which resumes into
+         * an endless sigreturn loop or a jump to address zero.
+         *
+         * It is a window of maybe ten instructions against a 10 ms timer, so
+         * it happens once in a few million switches - which is to say never
+         * during development and constantly under load.
+         *
+         * The flag closes it. The handler treats "a switch is in flight" the
+         * same way it treats "the scheduler is running": there is nothing
+         * safe to preempt, so it returns and the tick is simply lost. It is
+         * cleared by the thread once it is genuinely running, at the two
+         * places a thread can come back to life - after the swapcontext in
+         * gth_switch_to_sched(), and at the top of gth_trampoline() for a
+         * thread starting for the first time.
+         */
+        grt.switching = 1;
         grt.cur  = t;
         t->state = GTH_RUNNING;
         if (swapcontext(&grt.sched_ctx, &t->ctx) != 0) {
@@ -418,23 +583,10 @@ static void gth_sched_loop(void)
             abort();
         }
         grt.cur = NULL;
-
-        /*
-         * Back from the thread. What to do with it is entirely a function of
-         * the state it set before switching, which is why no primitive needs
-         * to touch the run queue on its way out.
-         */
-        switch (t->state) {
-        case GTH_RUNNING:
-            gth_rq_push(t); /* yielded, still runnable */
-            break;
-        case GTH_DONE:
-            if (t->detached)
-                gth_slot_release(t);
-            break;
-        default:
-            break; /* BLOCKED or SLEEPING: parked on someone else's list */
-        }
+        /* The thread that just left is in grt.prev; the top of the loop has
+         * it. Nothing is done with t here, because control does not
+         * necessarily come back through this point - the first entry into
+         * this loop arrives at the top, not here. */
     }
 }
 

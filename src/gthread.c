@@ -84,6 +84,17 @@ int gth_init_config(const gth_config_t *cfg)
 
     gth_sched_bootstrap();
 
+    grt.epfd = -1;
+    if (gth_netpoll_init() != 0) {
+        int saved = errno;
+        gth_stack_pool_destroy(&grt.pool);
+        gth_stack_pool_destroy(&grt.sched_pool);
+        free(grt.threads);
+        memset(&grt, 0, sizeof(grt));
+        errno = saved;
+        return -1;
+    }
+
     if (gth_preempt_init() != 0) {
         int saved = errno;
         gth_stack_pool_destroy(&grt.pool);
@@ -108,6 +119,7 @@ void gth_shutdown(void)
     if (!grt.initialised)
         return;
     gth_preempt_stop();
+    gth_netpoll_shutdown();
     gth_stack_pool_destroy(&grt.pool);
     gth_stack_pool_destroy(&grt.sched_pool);
     free(grt.threads);

@@ -46,6 +46,7 @@ struct gth {
     void      *arg;
     int        detached;
     int        started;    /* has the context been entered at least once */
+    int        saved_errno; /* errno is a per-OS-thread global, see sched.c */
     int        crit;       /* critical section nesting depth, see preempt.c */
     /*
      * Set by whichever channel operation completes this thread's wait, so
@@ -71,6 +72,7 @@ struct gth_stack_pool {
 struct gth_runtime {
     int         initialised;
     struct gth *cur;          /* running thread, NULL while in the scheduler */
+    struct gth *prev;         /* thread that just gave up the CPU, unprocessed */
     struct gth *threads;      /* the slot pool */
     size_t      max_threads;
     struct gth *free_slots;   /* free list, linked through gth.next */
@@ -94,6 +96,15 @@ struct gth_runtime {
     volatile sig_atomic_t ticks;
     uint32_t    last_wake_scan; /* tick at which the sleeper list was last walked */
     struct gth *sleepers;       /* unsorted list of GTH_SLEEPING threads */
+
+    /*
+     * Set while the scheduler is handing the CPU to a thread but has not
+     * arrived there yet. See the long comment in gth_sched_loop().
+     */
+    volatile sig_atomic_t switching;
+
+    int         epfd;           /* epoll instance, -1 when netpoll is unused */
+    size_t      netpoll_parked; /* threads waiting on fd readiness */
 };
 
 extern struct gth_runtime grt;
@@ -102,6 +113,11 @@ extern struct gth_runtime grt;
 int   gth_stack_pool_init(struct gth_stack_pool *p, size_t nslots, size_t usable);
 void  gth_stack_pool_destroy(struct gth_stack_pool *p);
 void *gth_stack_slot(const struct gth_stack_pool *p, size_t i);
+
+/* netpoll.c */
+int   gth_netpoll_init(void);
+void  gth_netpoll_shutdown(void);
+void  gth_netpoll(int timeout_ms);
 
 /* preempt.c */
 #define GTH_TICK_MS 10
