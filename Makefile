@@ -54,7 +54,9 @@ DEMOS    := $(patsubst demo/%.c,$(BUILD)/%,$(wildcard demo/*.c))
 
 .PHONY: all clean test demos demo deadlock server bench asan
 
-all: $(LIB) $(TESTS) $(DEMOS)
+# Everything buildable, including the benchmarks - `make bench` runs them,
+# this only compiles them, so they are there to be run or profiled by hand.
+all: $(LIB) $(TESTS) $(DEMOS) $(BENCHES)
 
 $(BUILD):
 	@mkdir -p $(BUILD)
