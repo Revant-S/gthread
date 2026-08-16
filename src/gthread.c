@@ -79,7 +79,7 @@ int gth_init_config(const gth_config_t *cfg)
     main_thread->state      = GTH_RUNNING;
     main_thread->prio       = GTH_PRIO_DEFAULT;
     main_thread->base_prio  = GTH_PRIO_DEFAULT;
-    main_thread->started    = 1;
+    main_thread->started    = 1; /* already running on the process stack */
     grt.cur = main_thread;
 
     gth_sched_bootstrap();

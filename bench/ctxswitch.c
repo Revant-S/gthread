@@ -239,9 +239,18 @@ static void measure(const char *name, double (*fn)(long), long iters,
     fflush(stdout);
 }
 
-int main(void)
+/*
+ * With an argument, run only that mechanism. This exists for profiling: it is
+ * how the strace and perf numbers in docs/EXPLAIN.md were taken, because
+ * counting syscalls is only meaningful if the pthread comparisons - which are
+ * nothing but syscalls - are not in the same process.
+ *
+ *   ./build/ctxswitch green
+ */
+int main(int argc, char **argv)
 {
     struct result res[3];
+    const char *only = (argc > 1) ? argv[1] : NULL;
     double overhead;
     FILE  *md;
     long   iters = ITERS;
@@ -268,7 +277,13 @@ int main(void)
         return 1;
     }
 
-    measure("green",   green_run, iters, overhead, &res[0]);
+    measure("green", green_run, iters, overhead, &res[0]);
+    if (only != NULL) {
+        gth_chan_destroy(to_b);
+        gth_chan_destroy(to_a);
+        gth_shutdown();
+        return 0;
+    }
     measure("condvar", cv_run,    iters, overhead, &res[1]);
     measure("pipe",    pipe_run,  iters, overhead, &res[2]);
 

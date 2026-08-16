@@ -6,7 +6,11 @@
 # the exception and are built at -O2, see the bench target.
 
 CC       ?= gcc
-CFLAGS   := -std=c11 -D_GNU_SOURCE -Og -g3 -Wall -Wextra -Wpedantic -Iinclude
+# -U_FORTIFY_SOURCE because this toolchain enables fortification by default at
+# any optimisation level, and fortified longjmp aborts when the target frame is
+# not on the current stack. A user level thread switch is nothing but that.
+CFLAGS   := -std=c11 -D_GNU_SOURCE -Og -g3 -U_FORTIFY_SOURCE \
+            -Wall -Wextra -Wpedantic -Iinclude
 LDFLAGS  :=
 LDLIBS   :=
 
@@ -29,7 +33,7 @@ BENCH_CFLAGS := -std=c11 -D_GNU_SOURCE -O2 -U_FORTIFY_SOURCE -g -Wall -Wextra \
 # compiled in only when __SANITIZE_ADDRESS__ is defined. If a future ASan
 # still produces false positives here, that belongs in the README rather than
 # in a quietly deleted target.
-ASAN_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g3 -fsanitize=address,undefined \
+ASAN_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g3 -U_FORTIFY_SOURCE -fsanitize=address,undefined \
                -fno-omit-frame-pointer -Wall -Wextra -Wpedantic -Iinclude
 
 BUILD    := build
@@ -48,7 +52,7 @@ ASANTESTS := $(patsubst test/%.c,$(ASANBUILD)/%,$(wildcard test/*.c))
 ASANOBJS := $(patsubst src/%.c,$(ASANBUILD)/%.o,$(SRCS))
 DEMOS    := $(patsubst demo/%.c,$(BUILD)/%,$(wildcard demo/*.c))
 
-.PHONY: all clean test demos demo deadlock bench asan
+.PHONY: all clean test demos demo deadlock server bench asan
 
 all: $(LIB) $(TESTS) $(DEMOS)
 
@@ -99,6 +103,12 @@ $(BUILD)/deadlock_demo: demo/deadlock.c $(LIB) | $(BUILD)
 
 deadlock: $(BUILD)/deadlock_demo
 	$(BUILD)/deadlock_demo
+
+# TCP echo server, one green thread per connection. Ctrl-C to stop.
+# Override the port and the connection limit: make server ARGS="9002 20000"
+ARGS ?= 9001 12000
+server: $(BUILD)/echo_server
+	$(BUILD)/echo_server $(ARGS)
 
 clean:
 	rm -rf $(BUILD)

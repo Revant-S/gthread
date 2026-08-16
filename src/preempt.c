@@ -28,40 +28,63 @@ static stack_t   gth_sigstack;
 /* ------------------------------------------------------------------ */
 
 /*
- * A critical section here is exactly an interrupt mask on a bare metal
- * system: SIGALRM is the interrupt, sigprocmask is the mask register, and the
+ * A critical section is an interrupt mask: SIGALRM is the interrupt and the
  * run queue is the structure that must not be observed half updated. There is
- * only one CPU in this runtime, so there is nothing to spin against; the only
- * thing that can interleave with a run queue update is the signal handler,
- * and blocking the signal removes it.
+ * one CPU here, so there is nothing to spin against - the only thing that can
+ * interleave with a run queue update is the timer handler.
  *
- * The depth counter matters because these nest. gth_chan_send() takes a
- * critical section and calls gth_wake(), which takes another; if the inner
- * exit unblocked unconditionally, the outer section would run with the timer
- * live and could be preempted with the wait list half unlinked. So the mask
- * is only touched on the 0 -> 1 and 1 -> 0 transitions.
+ * The obvious way to write that, and the way this file did write it until M7,
+ * is sigprocmask(SIG_BLOCK) on the way in and SIG_UNBLOCK on the way out. It
+ * is correct and it is expensive: two syscalls around every channel
+ * operation, every semaphore, every wake. Six rt_sigprocmask calls per
+ * channel handover, measured.
  *
- * The counter lives in the TCB, not in a global, and that is not an
- * arbitrary choice. A thread is allowed to block while holding a critical
- * section - that is precisely what every wait primitive does - and
- * swapcontext carries the signal mask with the context. If the mask is
- * per thread then the count has to be per thread as well, or the next thread
- * to run would inherit a depth it never entered.
+ * Deferred preemption removes all of them. The counter below is an ordinary
+ * userspace variable. The handler reads it, and if it is non-zero it does not
+ * switch - it records that a preemption is owed and returns. gth_exit_critical
+ * pays that debt at the moment the last section is released. Nothing enters
+ * the kernel in the common case.
+ *
+ * The tradeoff, stated plainly: preemption is now delayed by the length of
+ * the critical section rather than being impossible during it. Every critical
+ * section in this runtime is a few dozen instructions of list manipulation
+ * with no loops over unbounded data, so the delay is bounded and far below
+ * the 10 ms tick it would have to compete with. Against that, masking cost a
+ * syscall every single time. This is how real runtimes do it, for the same
+ * reason.
+ *
+ * The counter is per thread, in the TCB, because a thread is allowed to block
+ * while holding a critical section - that is exactly what every wait
+ * primitive does - and the thread that runs next must not inherit a depth it
+ * never entered.
+ *
+ * A note on the increment, which is not atomic. If the timer lands between
+ * the load and the store of crit++, the handler sees the old value, zero, and
+ * preempts. That is harmless: at that instant the section has not protected
+ * anything yet, no list has been touched, and the store completes when the
+ * thread is resumed. The decrement is safe for the mirror image reason - the
+ * handler sees the pre-decrement value, defers, and the pending flag is
+ * checked immediately afterwards.
  */
 void gth_enter_critical(void)
 {
-    struct gth *self = grt.cur;
-
-    if (self->crit++ == 0)
-        sigprocmask(SIG_BLOCK, &gth_alarm_set, NULL);
+    grt.cur->crit++;
 }
 
 void gth_exit_critical(void)
 {
     struct gth *self = grt.cur;
 
-    if (--self->crit == 0)
-        sigprocmask(SIG_UNBLOCK, &gth_alarm_set, NULL);
+    if (--self->crit == 0 && grt.preempt_pending) {
+        grt.preempt_pending = 0;
+        gth_yield(); /* the tick that arrived while the section was held */
+    }
+}
+
+/* Used by the scheduler after a switch that escaped a signal handler. */
+void gth_unblock_alarm(void)
+{
+    sigprocmask(SIG_UNBLOCK, &gth_alarm_set, NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -127,6 +150,24 @@ static void gth_tick_handler(int sig)
     if (grt.cur == NULL || grt.switching)
         return;
 
+    /*
+     * A critical section is held, so the run queue may be half updated and
+     * switching now would corrupt it. Record the debt and return; whoever
+     * releases the last section will yield on the way out. This is the entire
+     * cost of having made critical sections free.
+     */
+    if (grt.cur->crit > 0) {
+        grt.preempt_pending = 1;
+        return;
+    }
+
+    /*
+     * About to leave this handler without returning from it, so no sigreturn
+     * will run and SIGALRM stays blocked - the kernel blocked it on entry.
+     * The scheduler unblocks it on the other side. Doing it here instead
+     * would open a window for this handler to be re-entered on top of itself.
+     */
+    grt.alarm_blocked = 1;
     gth_switch_to_sched();
 }
 

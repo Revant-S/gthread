@@ -233,14 +233,26 @@ void gth_slot_release(struct gth *t)
  * state (RUNNING if it merely yielded, BLOCKED/SLEEPING/DONE otherwise) and
  * has already put itself on whatever list will wake it up again.
  *
- * swapcontext() saves the callee-saved registers, the stack pointer, the
- * program counter and the signal mask into the first argument, then installs
- * the second. Everything else - the caller-saved registers, the FPU state
- * that matters - is dead across a function call by the ABI, so there is
- * nothing else to save. The signal mask being part of the saved set is not a
- * detail: it is what lets M2 mask SIGALRM around a run queue update and have
- * the mask travel with the thread across a block, instead of leaking into
- * whoever runs next.
+ * This used to be swapcontext(), and swapcontext() is the honest, obvious
+ * thing to write: it saves the callee-saved registers, the stack pointer, the
+ * program counter and the signal mask, and installs another set. The problem
+ * is that last item. The signal mask lives in the kernel, so saving and
+ * restoring it means a real rt_sigprocmask syscall on every single switch -
+ * on the hottest path in the runtime, to move a value the runtime already
+ * knows.
+ *
+ * _setjmp and _longjmp are the same machine level operation with that one
+ * feature removed: the underscore variants deliberately do not touch the
+ * signal mask (setjmp/longjmp on glibc may, depending on savemask). So the
+ * steady state switch is now a store of the callee-saved registers to memory
+ * and a jump - no syscall at all. What makes that safe is that the runtime
+ * stopped relying on the context to carry the mask: since M7 the mask barely
+ * moves, because critical sections are a userspace counter rather than a
+ * blocked signal. libtask and libmill both switch this way and are the prior
+ * art for it.
+ *
+ * The measured effect is in bench/results.md: about six rt_sigprocmask calls
+ * per handover before, none after.
  */
 /*
  * AddressSanitizer keeps a shadow map of what is and is not a valid stack, and
@@ -335,9 +347,21 @@ void gth_switch_to_sched(void)
     grt.prev = self;
 
     gth_asan_enter(gth_stack_slot(&grt.sched_pool, 0), grt.sched_pool.usable);
-    if (swapcontext(&self->ctx, &grt.sched_ctx) != 0) {
-        perror("gthread: swapcontext");
-        abort();
+    if (_setjmp(self->jb) == 0) {
+        /*
+         * Same bootstrap problem as a new thread, one level up: the very
+         * first switch has no jmp_buf to jump to, because the scheduler has
+         * never run and so has never called _setjmp. That one time, go
+         * through the context that gth_sched_bootstrap() built.
+         */
+        if (grt.sched_started) {
+            _longjmp(grt.sched_jb, 1);
+        } else {
+            grt.sched_started = 1;
+            setcontext(&grt.sched_ctx);
+            perror("gthread: setcontext");
+            abort();
+        }
     }
     gth_asan_leave();
 
@@ -418,7 +442,7 @@ void gth_thread_setup_context(struct gth *t)
     t->ctx.uc_link = NULL;
     makecontext(&t->ctx, (void (*)(void))gth_trampoline, 2,
                 (int)(uint32_t)p, (int)(uint32_t)(p >> 32));
-    t->started = 1;
+    t->started = 0; /* the scheduler sets this when it first enters the stack */
 }
 
 /* ------------------------------------------------------------------ */
@@ -495,6 +519,15 @@ static int gth_idle_timeout_ms(void)
 
 static void gth_sched_loop(void)
 {
+    /*
+     * volatile because this frame calls _setjmp and this variable is written
+     * after it. A non-volatile local live across a longjmp may be held in a
+     * register that _longjmp restores to its old value, which the compiler
+     * warns about (-Wclobbered) and which would silently re-enable the
+     * message below on every tick.
+     */
+    volatile int reported = 0;
+
     for (;;) {
         struct gth *t;
 
@@ -570,8 +603,21 @@ static void gth_sched_loop(void)
              * a deadlock that hangs quietly is a bug report nobody can act
              * on, and a deadlock that spins looks like a performance problem.
              */
-            fputs("gthread: deadlock - no runnable threads, no timers "
-                  "pending and no I/O outstanding\n", stderr);
+            if (!reported) {
+                fprintf(stderr,
+                        "gthread: deadlock - nothing runnable, nothing "
+                        "sleeping, no I/O outstanding (live threads %zu, "
+                        "parked on I/O %zu, tick %u)\n",
+                        grt.nlive, grt.netpoll_parked, (uint32_t)grt.ticks);
+                reported = 1;
+            }
+            /*
+             * Wait rather than spin or exit. Exiting would throw away the
+             * process state that a debugger is about to be pointed at, and
+             * spinning would look like a busy program rather than a stuck
+             * one. pause() returns on every tick, hence the flag: the report
+             * is worth printing once, not a hundred times a second.
+             */
             pause();
             continue;
         }
@@ -614,13 +660,48 @@ static void gth_sched_loop(void)
         grt.switching = 1;
         grt.cur  = t;
         t->state = GTH_RUNNING;
+        /*
+         * A deferred preemption belongs to the thread that was running when
+         * the tick arrived, and that thread is about to be descheduled here
+         * anyway, so the debt is settled. Leaving the flag set would charge it
+         * to whoever releases the next critical section.
+         */
+        grt.preempt_pending = 0;
         gth_asan_enter(t->stack, t->stack_size);
-        if (swapcontext(&grt.sched_ctx, &t->ctx) != 0) {
-            perror("gthread: swapcontext");
-            abort();
+
+        if (_setjmp(grt.sched_jb) == 0) {
+            if (t->started) {
+                _longjmp(t->jb, 1); /* the steady state path: no syscall */
+            } else {
+                /*
+                 * First run. A jmp_buf can only be made by _setjmp, and
+                 * _setjmp can only be called on a stack that is already
+                 * running - which a brand new stack is not. makecontext exists
+                 * for exactly this, so it is kept for exactly this: one
+                 * setcontext per thread lifetime, and never again.
+                 */
+                t->started = 1;
+                setcontext(&t->ctx);
+                perror("gthread: setcontext");
+                abort();
+            }
         }
+
         gth_asan_leave();
         grt.cur = NULL;
+
+        /*
+         * If the switch that brought us here came out of the signal handler,
+         * SIGALRM is still blocked - the handler was entered with it masked
+         * and we left through a _longjmp rather than by returning, so no
+         * sigreturn ever put it back. Undo that by hand. It is one syscall
+         * per preemption, a hundred times a second, rather than one per
+         * switch, which is millions of times a second.
+         */
+        if (grt.alarm_blocked) {
+            gth_unblock_alarm();
+            grt.alarm_blocked = 0;
+        }
         /* The thread that just left is in grt.prev; the top of the loop has
          * it. Nothing is done with t here, because control does not
          * necessarily come back through this point - the first entry into
@@ -654,19 +735,12 @@ void gth_sched_bootstrap(void)
     grt.sched_ctx.uc_link          = NULL;
 
     /*
-     * The scheduler always runs with SIGALRM blocked, and the mask is set
-     * here, once, because swapcontext restores it on every entry into the
-     * scheduler for free.
-     *
-     * This is not tidiness, it is a correctness requirement. Between
-     * "grt.cur = t" and the swapcontext that actually installs t's registers
-     * there are a few instructions during which grt.cur names a thread that
-     * is not running. A tick delivered in that window would find cur non-NULL
-     * and switch out - saving the scheduler's own registers into t->ctx, on
-     * top of the context it was about to resume. Blocking the timer for the
-     * whole scheduler removes the window instead of trying to make it small.
+     * The scheduler no longer runs with SIGALRM masked - that cost a syscall
+     * on every entry and it is not what keeps it safe. What keeps it safe is
+     * that the handler refuses to preempt when grt.cur is NULL, which is true
+     * for exactly as long as the scheduler is on the CPU, and refuses again
+     * while grt.switching is set, which covers the handover windows at both
+     * ends.
      */
-    sigaddset(&grt.sched_ctx.uc_sigmask, SIGALRM);
-
     makecontext(&grt.sched_ctx, gth_sched_entry, 0);
 }

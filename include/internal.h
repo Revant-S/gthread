@@ -7,6 +7,7 @@
 #ifndef GTHREAD_INTERNAL_H
 #define GTHREAD_INTERNAL_H
 
+#include <setjmp.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -31,7 +32,17 @@ enum gth_state {
  * gth_select() is the exception and it does not use this field - see chan.c.
  */
 struct gth {
-    ucontext_t ctx;        /* saved machine context, valid while not running */
+    /*
+     * Two ways to enter this thread, for two different situations.
+     *
+     * jb is the steady state one: _setjmp/_longjmp, no syscall, used for every
+     * switch after the first. ctx is used exactly once per thread, to build a
+     * stack that has never been run on - there is no way to manufacture a
+     * jmp_buf pointing at a fresh stack in portable C, and makecontext is the
+     * POSIX tool for precisely that job. See gth_sched_loop().
+     */
+    jmp_buf    jb;
+    ucontext_t ctx;        /* first entry only, see above */
     void      *stack;      /* lowest usable byte of this slot's stack */
     size_t     stack_size;
     int        id;
@@ -83,7 +94,9 @@ struct gth_runtime {
     struct gth *rq_tail[GTH_PRIO_LEVELS];
     uint32_t    ready_bitmap;
 
-    ucontext_t  sched_ctx;    /* the scheduler loop's own context */
+    jmp_buf     sched_jb;     /* the scheduler's steady state entry point */
+    int         sched_started; /* sched_jb is only valid once the loop has run */
+    ucontext_t  sched_ctx;    /* used once, to start the scheduler loop */
     struct gth_stack_pool pool;       /* green thread stacks */
     struct gth_stack_pool sched_pool; /* one slot: the scheduler's own stack */
 
@@ -102,6 +115,16 @@ struct gth_runtime {
      * arrived there yet. See the long comment in gth_sched_loop().
      */
     volatile sig_atomic_t switching;
+
+    /*
+     * Deferred preemption. The handler sets pending when it cannot switch
+     * because a critical section is held; gth_exit_critical() takes the
+     * preemption when the last one is released. alarm_blocked records that a
+     * switch left a signal handler without returning from it, so the
+     * scheduler knows it has to unblock SIGALRM by hand.
+     */
+    volatile sig_atomic_t preempt_pending;
+    volatile sig_atomic_t alarm_blocked;
 
     int         epfd;           /* epoll instance, -1 when netpoll is unused */
     size_t      netpoll_parked; /* threads waiting on fd readiness */
@@ -125,6 +148,7 @@ int   gth_preempt_init(void);
 void  gth_preempt_stop(void);
 void  gth_enter_critical(void);
 void  gth_exit_critical(void);
+void  gth_unblock_alarm(void);
 
 /* sched.c */
 void  gth_rq_push(struct gth *t);
